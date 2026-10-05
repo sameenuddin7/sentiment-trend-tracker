@@ -1,0 +1,166 @@
+"""Sentiment Trend Tracker
+SQLite -> text extraction -> lexicon matching -> score -> temporal aggregation
+-> outlier detection -> gsentiment.js (consumed by mood_monitor.html with D3.js)
+"""
+import argparse
+import json
+import re
+import sqlite3
+import statistics
+from collections import defaultdict
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from lexicon import negative_words, positive_words
+
+HERE = Path(__file__).parent
+POS, NEG = set(positive_words), set(negative_words)
+DATE_HINTS = ("date", "time", "created", "posted", "timestamp")
+TEXT_HINTS = ("review", "feedback", "comment", "text", "message")
+
+
+# ---- Steps 3-4: connect and understand the schema -------------------------------
+def discover_schema(conn):
+    """Find the table + (timestamp column, text column) holding the feedback."""
+    for (table,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table'"):
+        cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')]
+        date_col = next((c for c in cols if any(h in c.lower() for h in DATE_HINTS)), None)
+        text_col = next((c for c in cols if any(h in c.lower() for h in TEXT_HINTS)
+                         and c != date_col), None)
+        if date_col and text_col:
+            return table, date_col, text_col
+    raise RuntimeError("No table with a timestamp column and a review/feedback text column found")
+
+
+# ---- Steps 7-9: preprocessing and scoring ---------------------------------------
+def tokenize(text):
+    return re.findall(r"[a-z']+", (text or "").lower())
+
+
+def score_text(text):
+    """Return (score, positive_count, negative_count); score = pos - neg."""
+    words = tokenize(text)
+    pos = sum(w in POS for w in words)
+    neg = sum(w in NEG for w in words)
+    return pos - neg, pos, neg
+
+
+def parse_timestamp(value):
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value)
+    s = str(value).strip().replace("Z", "")
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(s, fmt)
+            except ValueError:
+                pass
+    raise ValueError(f"Unrecognised date format: {value!r}")
+
+
+def read_scores(conn):
+    """Steps 6-10: yield (datetime, score) for every feedback record."""
+    table, date_col, text_col = discover_schema(conn)
+    scored = []
+    for ts, text in conn.execute(f'SELECT "{date_col}", "{text_col}" FROM "{table}"'):
+        scored.append((parse_timestamp(ts), score_text(text)[0]))
+    return scored
+
+
+# ---- Steps 11-12: temporal aggregation ------------------------------------------
+def period_of(dt, mode):
+    """Return (label, period start date) for a month or ISO week."""
+    if mode == "month":
+        return dt.strftime("%Y-%m"), dt.replace(day=1).date()
+    year, week, _ = dt.isocalendar()
+    return f"{year}-W{week:02d}", (dt - timedelta(days=dt.weekday())).date()
+
+
+def aggregate(scored, mode="month"):
+    groups, starts = defaultdict(list), {}
+    for dt, s in scored:
+        label, start = period_of(dt, mode)
+        groups[label].append(s)
+        starts[label] = start
+    rows = [{"period": k, "start": starts[k].isoformat(),
+             "avg": round(sum(v) / len(v), 3), "count": len(v)} for k, v in groups.items()]
+    return sorted(rows, key=lambda r: r["start"])
+
+
+# ---- Step 13: outlier detection -------------------------------------------------
+def flag_outliers(rows, z_threshold=-1.5):
+    """Mark periods whose average is unusually low (z-score <= threshold)."""
+    avgs = [r["avg"] for r in rows]
+    mean = statistics.mean(avgs) if avgs else 0
+    sd = statistics.pstdev(avgs) if len(avgs) > 1 else 0
+    for r in rows:
+        r["z"] = round((r["avg"] - mean) / sd, 2) if sd else 0.0
+        r["outlier"] = bool(sd) and r["z"] <= z_threshold
+    return {"mean": round(mean, 3), "std": round(sd, 3), "threshold": z_threshold}
+
+
+def daily_outliers(scored, z_threshold=-2.0):
+    days = defaultdict(list)
+    for dt, s in scored:
+        days[dt.date().isoformat()].append(s)
+    rows = [{"period": d, "start": d, "avg": round(sum(v) / len(v), 3), "count": len(v)}
+            for d, v in sorted(days.items())]
+    flag_outliers(rows, z_threshold)
+    return [r for r in rows if r["outlier"]]
+
+
+# ---- Steps 14-15: trend data + gsentiment.js ------------------------------------
+def build_trend(scored, z_month=-1.5, z_week=-1.5):
+    monthly, weekly = aggregate(scored, "month"), aggregate(scored, "week")
+    stats = {"monthly": flag_outliers(monthly, z_month), "weekly": flag_outliers(weekly, z_week)}
+    return {"monthly": monthly, "weekly": weekly, "stats": stats,
+            "dailyOutliers": daily_outliers(scored), "totalReviews": len(scored)}
+
+
+def write_js(trend, out_path):
+    chart = (HERE / "chart_template.js").read_text()
+    js = ("// Generated by sentiment_tracker.py - do not edit by hand.\n"
+          f"const SENTIMENT_DATA = {json.dumps(trend, indent=2)};\n\n{chart}")
+    Path(out_path).write_text(js)
+
+
+# ---- Step 21: console summary ---------------------------------------------------
+def print_summary(trend):
+    print(f"\nSentiment trend ({trend['totalReviews']} reviews)\n")
+    print(f"{'Month':<9}{'Avg':>7}{'Reviews':>9}   Trend")
+    for r in trend["monthly"]:
+        n = round(r["avg"] * 4)
+        bar = ("+" * n) if n > 0 else ("-" * -n)
+        flag = "  <-- OUTLIER (unusually negative)" if r["outlier"] else ""
+        print(f"{r['period']:<9}{r['avg']:>7.2f}{r['count']:>9}   {bar}{flag}")
+    low = [r["period"] for r in trend["weekly"] if r["outlier"]]
+    print(f"\nWeekly outliers: {', '.join(low) if low else 'none'}")
+    d = [r["period"] for r in trend["dailyOutliers"]]
+    print(f"Daily outliers : {', '.join(d) if d else 'none'}")
+
+
+def run(db_path, out_path, z_month=-1.5, z_week=-1.5, quiet=False):
+    if not Path(db_path).exists():
+        from create_database import create
+        create(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        trend = build_trend(read_scores(conn), z_month, z_week)
+    finally:
+        conn.close()
+    write_js(trend, out_path)
+    if not quiet:
+        print_summary(trend)
+        print(f"\nWrote {out_path}. Open mood_monitor.html in a browser.")
+    return trend
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Sentiment Trend Tracker")
+    ap.add_argument("--db", default=str(HERE / "reviews.db"))
+    ap.add_argument("--out", default=str(HERE / "gsentiment.js"))
+    ap.add_argument("--z", type=float, default=-1.5, help="outlier z-score threshold (default -1.5)")
+    a = ap.parse_args()
+    run(a.db, a.out, a.z, a.z)
